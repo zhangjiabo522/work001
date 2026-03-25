@@ -3,19 +3,18 @@ const FALLBACK_UPSTREAM_URL =
   "https://r.jina.ai/http://api.lolimi.cn/API/baby/gohome?type=json";
 const MAX_DIRECT_RETRIES = 2;
 const UPSTREAM_TIMEOUT_MS = 9000;
-const EDGE_CACHE_TTL_SECONDS = 20;
-const LAST_GOOD_TTL_MS = 10 * 60 * 1000;
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
-let lastGoodPayload = null;
-let lastGoodAt = 0;
 
 function jsonResponse(data, init = {}) {
   const headers = new Headers(init.headers || {});
   headers.set("content-type", "application/json; charset=utf-8");
+  headers.set("Cache-Control", "no-store, no-cache, must-revalidate");
+  headers.set("Pragma", "no-cache");
+  headers.set("Expires", "0");
 
   for (const [key, value] of Object.entries(CORS_HEADERS)) {
     headers.set(key, value);
@@ -29,6 +28,17 @@ function jsonResponse(data, init = {}) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function stripAuthorField(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return payload;
+  }
+  const next = { ...payload };
+  if ("author" in next) {
+    delete next.author;
+  }
+  return next;
 }
 
 function isValidUpstreamPayload(payload) {
@@ -52,20 +62,10 @@ function isRateLimitedPayload(payload) {
   );
 }
 
-function createCacheKey(request) {
-  const url = new URL(request.url);
-  url.pathname = "/__baby_cache";
-  url.search = "";
-  return new Request(url.toString(), { method: "GET" });
-}
-
-function buildSuccessResponse(payload, cacheHeaderValue, extraHeaders = {}) {
-  return jsonResponse(payload, {
+function buildSuccessResponse(payload, extraHeaders = {}) {
+  return jsonResponse(stripAuthorField(payload), {
     status: 200,
-    headers: {
-      "Cache-Control": cacheHeaderValue,
-      ...extraHeaders,
-    },
+    headers: extraHeaders,
   });
 }
 
@@ -97,19 +97,19 @@ async function fetchTextWithTimeout(url) {
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
 
   try {
-    const response = await fetch(url, {
+    const requestUrl = new URL(url);
+    requestUrl.searchParams.set("_ts", Date.now().toString());
+    requestUrl.searchParams.set("_r", Math.random().toString(36).slice(2));
+
+    const response = await fetch(requestUrl.toString(), {
       method: "GET",
       headers: {
         accept: "application/json, text/plain;q=0.9, */*;q=0.8",
+        "cache-control": "no-cache",
+        pragma: "no-cache",
       },
       redirect: "follow",
       signal: controller.signal,
-      cf: {
-        cacheTtlByStatus: {
-          "200-299": 30,
-          "400-599": 0,
-        },
-      },
     });
 
     const text = await response.text();
@@ -119,20 +119,7 @@ async function fetchTextWithTimeout(url) {
   }
 }
 
-async function proxyUpstream(request) {
-  const cache = caches.default;
-  const cacheKey = createCacheKey(request);
-  const cachedResponse = await cache.match(cacheKey);
-
-  if (cachedResponse) {
-    const headers = new Headers(cachedResponse.headers);
-    headers.set("x-worker-cache", "HIT");
-    return new Response(cachedResponse.body, {
-      status: cachedResponse.status,
-      headers,
-    });
-  }
-
+async function proxyUpstream() {
   let lastStatus = null;
   let lastError = null;
 
@@ -143,15 +130,7 @@ async function proxyUpstream(request) {
 
       const payload = parseJsonFromText(text);
       if (isValidUpstreamPayload(payload)) {
-        const successResponse = buildSuccessResponse(
-          payload,
-          `public, max-age=${EDGE_CACHE_TTL_SECONDS}, s-maxage=${EDGE_CACHE_TTL_SECONDS}`,
-          { "x-worker-cache": "MISS" },
-        );
-        lastGoodPayload = payload;
-        lastGoodAt = Date.now();
-        await cache.put(cacheKey, successResponse.clone());
-        return successResponse;
+        return buildSuccessResponse(payload, { "x-worker-source": "direct" });
       }
     } catch (error) {
       lastError = error;
@@ -165,27 +144,13 @@ async function proxyUpstream(request) {
     lastStatus = response.status;
     const payload = parseJsonFromText(text);
     if (isValidUpstreamPayload(payload)) {
-      const successResponse = buildSuccessResponse(
-        payload,
-        `public, max-age=${EDGE_CACHE_TTL_SECONDS}, s-maxage=${EDGE_CACHE_TTL_SECONDS}`,
-        { "x-worker-cache": "MISS-FALLBACK" },
-      );
-      lastGoodPayload = payload;
-      lastGoodAt = Date.now();
-      await cache.put(cacheKey, successResponse.clone());
-      return successResponse;
+      return buildSuccessResponse(payload, { "x-worker-source": "fallback" });
     }
     if (isRateLimitedPayload(payload)) {
       lastError = new Error("Fallback source rate limited");
     }
   } catch (error) {
     lastError = error;
-  }
-
-  if (lastGoodPayload && Date.now() - lastGoodAt <= LAST_GOOD_TTL_MS) {
-    return buildSuccessResponse(lastGoodPayload, "public, max-age=10", {
-      "x-worker-cache": "STALE-MEMORY",
-    });
   }
 
   return jsonResponse(
@@ -221,7 +186,7 @@ export default {
     }
 
     if (url.pathname === "/" || url.pathname === "/api/baby") {
-      return proxyUpstream(request);
+      return proxyUpstream();
     }
 
     return jsonResponse(
