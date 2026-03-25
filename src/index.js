@@ -3,11 +3,15 @@ const FALLBACK_UPSTREAM_URL =
   "https://r.jina.ai/http://api.lolimi.cn/API/baby/gohome?type=json";
 const MAX_DIRECT_RETRIES = 2;
 const UPSTREAM_TIMEOUT_MS = 9000;
+const EDGE_CACHE_TTL_SECONDS = 20;
+const LAST_GOOD_TTL_MS = 10 * 60 * 1000;
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET,OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
+let lastGoodPayload = null;
+let lastGoodAt = 0;
 
 function jsonResponse(data, init = {}) {
   const headers = new Headers(init.headers || {});
@@ -25,6 +29,44 @@ function jsonResponse(data, init = {}) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isValidUpstreamPayload(payload) {
+  return Boolean(
+    payload &&
+      typeof payload === "object" &&
+      payload.code === 200 &&
+      payload.data &&
+      (payload.data.id || payload.data.id === 0),
+  );
+}
+
+function isRateLimitedPayload(payload) {
+  return Boolean(
+    payload &&
+      typeof payload === "object" &&
+      (payload.code === 429 ||
+        payload.status === 429 ||
+        payload.status === 42903 ||
+        String(payload.message || "").toLowerCase().includes("rate limit")),
+  );
+}
+
+function createCacheKey(request) {
+  const url = new URL(request.url);
+  url.pathname = "/__baby_cache";
+  url.search = "";
+  return new Request(url.toString(), { method: "GET" });
+}
+
+function buildSuccessResponse(payload, cacheHeaderValue, extraHeaders = {}) {
+  return jsonResponse(payload, {
+    status: 200,
+    headers: {
+      "Cache-Control": cacheHeaderValue,
+      ...extraHeaders,
+    },
+  });
 }
 
 function parseJsonFromText(text) {
@@ -77,7 +119,20 @@ async function fetchTextWithTimeout(url) {
   }
 }
 
-async function proxyUpstream() {
+async function proxyUpstream(request) {
+  const cache = caches.default;
+  const cacheKey = createCacheKey(request);
+  const cachedResponse = await cache.match(cacheKey);
+
+  if (cachedResponse) {
+    const headers = new Headers(cachedResponse.headers);
+    headers.set("x-worker-cache", "HIT");
+    return new Response(cachedResponse.body, {
+      status: cachedResponse.status,
+      headers,
+    });
+  }
+
   let lastStatus = null;
   let lastError = null;
 
@@ -87,13 +142,16 @@ async function proxyUpstream() {
       lastStatus = response.status;
 
       const payload = parseJsonFromText(text);
-      if (payload) {
-        return jsonResponse(payload, {
-          status: response.ok ? 200 : response.status,
-          headers: {
-            "Cache-Control": "public, max-age=20",
-          },
-        });
+      if (isValidUpstreamPayload(payload)) {
+        const successResponse = buildSuccessResponse(
+          payload,
+          `public, max-age=${EDGE_CACHE_TTL_SECONDS}, s-maxage=${EDGE_CACHE_TTL_SECONDS}`,
+          { "x-worker-cache": "MISS" },
+        );
+        lastGoodPayload = payload;
+        lastGoodAt = Date.now();
+        await cache.put(cacheKey, successResponse.clone());
+        return successResponse;
       }
     } catch (error) {
       lastError = error;
@@ -104,27 +162,40 @@ async function proxyUpstream() {
 
   try {
     const { response, text } = await fetchTextWithTimeout(FALLBACK_UPSTREAM_URL);
+    lastStatus = response.status;
     const payload = parseJsonFromText(text);
-    if (payload) {
-      return jsonResponse(payload, {
-        status: response.ok ? 200 : response.status,
-        headers: {
-          "Cache-Control": "public, max-age=15",
-        },
-      });
+    if (isValidUpstreamPayload(payload)) {
+      const successResponse = buildSuccessResponse(
+        payload,
+        `public, max-age=${EDGE_CACHE_TTL_SECONDS}, s-maxage=${EDGE_CACHE_TTL_SECONDS}`,
+        { "x-worker-cache": "MISS-FALLBACK" },
+      );
+      lastGoodPayload = payload;
+      lastGoodAt = Date.now();
+      await cache.put(cacheKey, successResponse.clone());
+      return successResponse;
+    }
+    if (isRateLimitedPayload(payload)) {
+      lastError = new Error("Fallback source rate limited");
     }
   } catch (error) {
     lastError = error;
   }
 
+  if (lastGoodPayload && Date.now() - lastGoodAt <= LAST_GOOD_TTL_MS) {
+    return buildSuccessResponse(lastGoodPayload, "public, max-age=10", {
+      "x-worker-cache": "STALE-MEMORY",
+    });
+  }
+
   return jsonResponse(
     {
-      code: 502,
+      code: 503,
       message: "Upstream temporarily unavailable",
       upstream_status: lastStatus,
       error: lastError instanceof Error ? lastError.message : null,
     },
-    { status: 502 },
+    { status: 503 },
   );
 }
 
@@ -150,7 +221,7 @@ export default {
     }
 
     if (url.pathname === "/" || url.pathname === "/api/baby") {
-      return proxyUpstream();
+      return proxyUpstream(request);
     }
 
     return jsonResponse(
