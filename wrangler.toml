@@ -1,4 +1,4 @@
-name = "baby-api-worker"
+name = "work001"
 main = "src/index.js"
 compatibility_date = "2026-03-25"
 workers_dev = true
